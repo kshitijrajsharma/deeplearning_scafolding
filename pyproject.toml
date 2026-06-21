@@ -1,0 +1,22 @@
+[project]
+name = "deeplearning-scafolding"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "kornia>=0.8.3",
+    "lightning>=2.6.5",
+    "matplotlib>=3.11.0",
+    "numpy>=2.4.6",
+    "scikit-learn>=1.9.0",
+    "segmentation-models-pytorch>=0.5.0",
+    "torch>=2.12.1",
+    "torchmetrics>=1.9.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.18",
+    "ty>=0.0.51",
+]
