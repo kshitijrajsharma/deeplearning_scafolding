@@ -18,7 +18,7 @@ from sklearn.metrics import (
     jaccard_score,
 )
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from torchmetrics.classification import MulticlassF1Score, MulticlassJaccardIndex
 
 matplotlib.use("Agg")
@@ -105,10 +105,8 @@ class SegModel(L.LightningModule):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
 
 
-def loader(split_dir, use_shade, batch_size, num_workers, shuffle, subset):
+def loader(split_dir, use_shade, batch_size, num_workers, shuffle):
     dataset = NpyDataset(split_dir, use_shade)
-    if subset:
-        dataset = Subset(dataset, range(min(subset, len(dataset))))
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -162,6 +160,22 @@ def evaluate(model, test_loader, out_dir):
         handle.write(summary)
 
 
+def plot_predictions(model, test_loader, path, n=3):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    images, labels = next(iter(test_loader))
+    with torch.no_grad():
+        preds = model(images.to(device)).argmax(1).cpu()
+    fig, axes = plt.subplots(n, 3, figsize=(9, 3 * n))
+    for row in range(n):
+        rgb = images[row, :3].permute(1, 2, 0).numpy()
+        panels = [(rgb, "image"), (labels[row], "mask"), (preds[row], "prediction")]
+        for ax, (data, title) in zip(axes[row], panels):
+            ax.imshow(data, vmin=0, vmax=len(CLASS_NAMES) - 1)
+            ax.set_title(title)
+            ax.axis("off")
+    fig.savefig(path, bbox_inches="tight")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="data/dataset")
@@ -169,9 +183,6 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument(
-        "--subset", type=int, default=0, help="cap tiles per split for a smoke run"
-    )
     parser.add_argument(
         "--use-shade", action=argparse.BooleanOptionalAction, default=True
     )
@@ -189,7 +200,6 @@ def main():
         use_shade=args.use_shade,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        subset=args.subset,
     )
     train_loader = make(os.path.join(args.data, "train"), shuffle=True)
     val_loader = make(os.path.join(args.data, "val"), shuffle=False)
@@ -214,6 +224,7 @@ def main():
     plot_history(model, os.path.join(args.out, "f1_curve.png"))
     best = SegModel.load_from_checkpoint(checkpoint.best_model_path)
     evaluate(best, test_loader, args.out)
+    plot_predictions(best, test_loader, os.path.join(args.out, "predictions.png"))
 
 
 if __name__ == "__main__":
