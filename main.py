@@ -257,12 +257,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument(
-        "--use-shade", action=argparse.BooleanOptionalAction, default=True
-    )
-    parser.add_argument(
-        "--use-aug", action=argparse.BooleanOptionalAction, default=True
-    )
+    parser.add_argument("--use-shade", action="store_true")
+    parser.add_argument("--use-aug", action="store_true")
     parser.add_argument("--out", default="outputs")
     args = parser.parse_args()
 
