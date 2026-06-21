@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 CLASS_NAMES = ["background", "tall", "flat"]  # label values 0, 1, 2
 PATIENCE = 10  # early-stopping patience on val_f1
-RESOLUTION = 0.08  
+RESOLUTION = 0.08
 TILE_CRS = "EPSG:25832"  # ETRS89 / UTM 32N;
 LABEL_CMAP = ListedColormap(["#2b2b2b", "#2ca02c", "#bcbd22"])  # bg, tall, flat
 
@@ -248,9 +248,6 @@ def vectorize_predictions(model, dataset, out_dir, n_tiles=6):
         ]
     gdf = gpd.GeoDataFrame(records, crs=TILE_CRS)
     gdf.to_file(os.path.join(out_dir, "predictions.geojson"), driver="GeoJSON")
-    gdf.plot(column="class", legend=True, cmap="tab10", figsize=(8, 8))
-    plt.title(f"Vectorized predictions ({TILE_CRS})")
-    plt.savefig(os.path.join(out_dir, "predictions_map.png"), bbox_inches="tight")
 
 
 def main():
@@ -271,7 +268,7 @@ def main():
 
     os.makedirs(args.out, exist_ok=True)
     plot_distribution(args.data, os.path.join(args.out, "class_distribution.png"))
-
+    print("use shade", args.use_shade, "use aug", args.use_aug)
     data = VegDataModule(args.data, args.use_shade, args.batch_size, args.num_workers)
     model = SegModel(in_channels=data.in_channels, lr=args.lr, use_aug=args.use_aug)
     early_stop = L.pytorch.callbacks.EarlyStopping(
