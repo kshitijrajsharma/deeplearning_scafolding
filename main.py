@@ -64,7 +64,7 @@ class SegModel(L.LightningModule):
         )
         self.train_f1 = MulticlassF1Score(num_classes, average="micro")
         self.val_f1 = MulticlassF1Score(num_classes, average="micro")
-        self.val_miou = MulticlassJaccardIndex(num_classes, average="micro")
+        self.val_iou = MulticlassJaccardIndex(num_classes, average="micro")
         self.train_history = []
         self.val_history = []
 
@@ -90,16 +90,16 @@ class SegModel(L.LightningModule):
         image, label = batch
         logits = self(image)
         self.val_f1.update(logits.argmax(1), label)
-        self.val_miou.update(logits.argmax(1), label)
+        self.val_iou.update(logits.argmax(1), label)
         self.log("val_loss", self.loss(logits, label), prog_bar=True)
 
     def on_validation_epoch_end(self):
         f1 = self.val_f1.compute().item()  # ty: ignore[missing-argument]
         self.log("val_f1", f1, prog_bar=True)
-        self.log("val_miou", self.val_miou.compute().item(), prog_bar=True)  # ty: ignore[missing-argument]
+        self.log("val_iou", self.val_iou.compute().item(), prog_bar=True)  # ty: ignore[missing-argument]
         self.val_history.append(f1)
         self.val_f1.reset()
-        self.val_miou.reset()
+        self.val_iou.reset()
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
