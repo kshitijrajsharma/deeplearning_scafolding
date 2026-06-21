@@ -3,14 +3,20 @@
 import argparse
 import glob
 import os
-from functools import partial
 
+import geopandas as gpd
 import kornia.augmentation as K
 import lightning as L
 import matplotlib
 import numpy as np
+import pandas as pd
+import rasterio.features
 import segmentation_models_pytorch as smp
 import torch
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
+from rasterio.transform import from_origin
+from shapely.geometry import shape
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
@@ -25,6 +31,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 CLASS_NAMES = ["background", "tall", "flat"]  # label values 0, 1, 2
+PATIENCE = 10  # early-stopping patience on val_f1
+RESOLUTION = 0.08  
+TILE_CRS = "EPSG:25832"  # ETRS89 / UTM 32N;
+LABEL_CMAP = ListedColormap(["#2b2b2b", "#2ca02c", "#bcbd22"])  # bg, tall, flat
 
 
 class NpyDataset(Dataset):
@@ -42,6 +52,37 @@ class NpyDataset(Dataset):
         image = torch.from_numpy(tile[: self.channels] / 255.0)
         label = torch.from_numpy(tile[5]).long()
         return image, label
+
+
+class VegDataModule(L.LightningDataModule):
+    """Train/val/test loaders over the split folders; `use_shade` sets input channels."""
+
+    def __init__(self, data_dir, use_shade=True, batch_size=16, num_workers=4):
+        super().__init__()
+        self.data_dir = data_dir
+        self.use_shade = use_shade
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.in_channels = 5 if use_shade else 4
+
+    def _loader(self, split, shuffle):
+        dataset = NpyDataset(os.path.join(self.data_dir, split), self.use_shade)
+        return DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            num_workers=self.num_workers,
+            pin_memory=torch.cuda.is_available(),
+        )
+
+    def train_dataloader(self):
+        return self._loader("train", shuffle=True)
+
+    def val_dataloader(self):
+        return self._loader("val", shuffle=False)
+
+    def test_dataloader(self):
+        return self._loader("test", shuffle=False)
 
 
 class SegModel(L.LightningModule):
@@ -62,9 +103,9 @@ class SegModel(L.LightningModule):
             K.RandomVerticalFlip(p=0.5),
             data_keys=["input", "mask"],
         )
-        self.train_f1 = MulticlassF1Score(num_classes, average="micro")
-        self.val_f1 = MulticlassF1Score(num_classes, average="micro")
-        self.val_iou = MulticlassJaccardIndex(num_classes, average="micro")
+        self.train_f1 = MulticlassF1Score(num_classes, average="macro")
+        self.val_f1 = MulticlassF1Score(num_classes, average="macro")
+        self.val_iou = MulticlassJaccardIndex(num_classes, average="macro")
         self.train_history = []
         self.val_history = []
 
@@ -105,15 +146,19 @@ class SegModel(L.LightningModule):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
 
 
-def loader(split_dir, use_shade, batch_size, num_workers, shuffle):
-    dataset = NpyDataset(split_dir, use_shade)
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+def plot_distribution(data_dir, path, splits=("train", "val", "test")):
+    def proportions(split):
+        counts = np.zeros(len(CLASS_NAMES), dtype=np.int64)
+        for file in glob.glob(os.path.join(data_dir, split, "*.npy")):
+            label = np.load(file, mmap_mode="r")[5].astype(int).ravel()
+            counts += np.bincount(label, minlength=len(CLASS_NAMES))
+        return counts / counts.sum()
+
+    dist = pd.DataFrame({s: proportions(s) for s in splits}, index=CLASS_NAMES)
+    dist.T.plot.bar(
+        title="Class proportion per split", ylabel="pixel proportion", rot=0
     )
+    plt.savefig(path, bbox_inches="tight")
 
 
 def plot_history(model, path):
@@ -170,10 +215,42 @@ def plot_predictions(model, test_loader, path, n=3):
         rgb = images[row, :3].permute(1, 2, 0).numpy()
         panels = [(rgb, "image"), (labels[row], "mask"), (preds[row], "prediction")]
         for ax, (data, title) in zip(axes[row], panels):
-            ax.imshow(data, vmin=0, vmax=len(CLASS_NAMES) - 1)
+            ax.imshow(data, cmap=LABEL_CMAP, vmin=0, vmax=len(CLASS_NAMES) - 1)
             ax.set_title(title)
             ax.axis("off")
+    handles = [
+        Patch(color=LABEL_CMAP(i), label=name) for i, name in enumerate(CLASS_NAMES)
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=len(CLASS_NAMES))
     fig.savefig(path, bbox_inches="tight")
+
+
+def vectorize_predictions(model, dataset, out_dir, n_tiles=6):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.eval().to(device)
+    records = []
+    for file in dataset.files[:n_tiles]:
+        tile = np.load(file).astype(np.float32)
+        image = (
+            torch.from_numpy(tile[: dataset.channels] / 255.0).unsqueeze(0).to(device)
+        )
+        with torch.no_grad():
+            pred = model(image).argmax(1)[0].cpu().numpy().astype("int32")
+        name = os.path.splitext(os.path.basename(file))[0]
+        east, north = (int(v) for v in name.split("_")[1:3])
+        transform = from_origin(
+            east, north + pred.shape[0] * RESOLUTION, RESOLUTION, RESOLUTION
+        )
+        records += [
+            {"geometry": shape(geom), "class": CLASS_NAMES[int(value)], "tile": name}
+            for geom, value in rasterio.features.shapes(pred, transform=transform)
+            if value != 0
+        ]
+    gdf = gpd.GeoDataFrame(records, crs=TILE_CRS)
+    gdf.to_file(os.path.join(out_dir, "predictions.geojson"), driver="GeoJSON")
+    gdf.plot(column="class", legend=True, cmap="tab10", figsize=(8, 8))
+    plt.title(f"Vectorized predictions ({TILE_CRS})")
+    plt.savefig(os.path.join(out_dir, "predictions_map.png"), bbox_inches="tight")
 
 
 def main():
@@ -193,38 +270,33 @@ def main():
     args = parser.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
-    in_channels = 5 if args.use_shade else 4
+    plot_distribution(args.data, os.path.join(args.out, "class_distribution.png"))
 
-    make = partial(
-        loader,
-        use_shade=args.use_shade,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
+    data = VegDataModule(args.data, args.use_shade, args.batch_size, args.num_workers)
+    model = SegModel(in_channels=data.in_channels, lr=args.lr, use_aug=args.use_aug)
+    early_stop = L.pytorch.callbacks.EarlyStopping(
+        monitor="val_f1", mode="max", patience=PATIENCE
     )
-    train_loader = make(os.path.join(args.data, "train"), shuffle=True)
-    val_loader = make(os.path.join(args.data, "val"), shuffle=False)
-    test_loader = make(os.path.join(args.data, "test"), shuffle=False)
-
-    model = SegModel(in_channels=in_channels, lr=args.lr, use_aug=args.use_aug)
     checkpoint = L.pytorch.callbacks.ModelCheckpoint(
         monitor="val_f1", mode="max", dirpath=args.out, filename="best"
-    )
-    early_stop = L.pytorch.callbacks.EarlyStopping(
-        monitor="val_f1", mode="max", patience=10
     )
     trainer = L.Trainer(
         max_epochs=args.epochs,
         accelerator="auto",
-        callbacks=[checkpoint, early_stop],
+        callbacks=[early_stop, checkpoint],
         num_sanity_val_steps=0,
         log_every_n_steps=10,
     )
-    trainer.fit(model, train_loader, val_loader)
+    trainer.fit(model, datamodule=data)
+    optimizer = trainer.optimizers[0]
+    print(f"optimizer lr: {optimizer.param_groups[0]['lr']}")
 
     plot_history(model, os.path.join(args.out, "f1_curve.png"))
     best = SegModel.load_from_checkpoint(checkpoint.best_model_path)
+    test_loader = data.test_dataloader()
     evaluate(best, test_loader, args.out)
     plot_predictions(best, test_loader, os.path.join(args.out, "predictions.png"))
+    vectorize_predictions(best, test_loader.dataset, args.out)
 
 
 if __name__ == "__main__":
