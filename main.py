@@ -18,6 +18,7 @@ from matplotlib.patches import Patch
 from rasterio.transform import from_origin
 from shapely.geometry import shape
 from sklearn.metrics import (
+    ConfusionMatrixDisplay,
     classification_report,
     confusion_matrix,
     f1_score,
@@ -25,31 +26,38 @@ from sklearn.metrics import (
 )
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from torchmetrics import MeanMetric
 from torchmetrics.classification import MulticlassF1Score, MulticlassJaccardIndex
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 CLASS_NAMES = ["background", "tall", "flat"]  # label values 0, 1, 2
+SEED = 42
 PATIENCE = 10  # early-stopping patience on val_f1
 RESOLUTION = 0.08
 TILE_CRS = "EPSG:25832"  # ETRS89 / UTM 32N;
 LABEL_CMAP = ListedColormap(["#2b2b2b", "#2ca02c", "#bcbd22"])  # bg, tall, flat
 
 
+def input_channels(use_ndvi, use_shade):
+    """Tile channel indices: RGB always, plus NDVI (3) and shade (4) when enabled."""
+    return [0, 1, 2] + ([3] if use_ndvi else []) + ([4] if use_shade else [])
+
+
 class NpyDataset(Dataset):
     """Tiles of shape (6, H, W): R, G, B, NDVI, shade, label."""
 
-    def __init__(self, split_dir, use_shade=True):
+    def __init__(self, split_dir, use_ndvi=True, use_shade=True):
         self.files = sorted(glob.glob(os.path.join(split_dir, "*.npy")))
-        self.channels = 5 if use_shade else 4
+        self.channels = input_channels(use_ndvi, use_shade)
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, index):
         tile = np.load(self.files[index]).astype(np.float32)
-        image = torch.from_numpy(tile[: self.channels] / 255.0)
+        image = torch.from_numpy(tile[self.channels] / 255.0)
         label = torch.from_numpy(tile[5]).long()
         return image, label
 
@@ -57,16 +65,21 @@ class NpyDataset(Dataset):
 class VegDataModule(L.LightningDataModule):
     """Train/val/test loaders over the split folders; `use_shade` sets input channels."""
 
-    def __init__(self, data_dir, use_shade=True, batch_size=16, num_workers=4):
+    def __init__(
+        self, data_dir, use_ndvi=True, use_shade=True, batch_size=16, num_workers=4
+    ):
         super().__init__()
         self.data_dir = data_dir
+        self.use_ndvi = use_ndvi
         self.use_shade = use_shade
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.in_channels = 5 if use_shade else 4
+        self.in_channels = len(input_channels(use_ndvi, use_shade))
 
     def _loader(self, split, shuffle):
-        dataset = NpyDataset(os.path.join(self.data_dir, split), self.use_shade)
+        dataset = NpyDataset(
+            os.path.join(self.data_dir, split), self.use_ndvi, self.use_shade
+        )
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -106,8 +119,12 @@ class SegModel(L.LightningModule):
         self.train_f1 = MulticlassF1Score(num_classes, average="macro")
         self.val_f1 = MulticlassF1Score(num_classes, average="macro")
         self.val_iou = MulticlassJaccardIndex(num_classes, average="macro")
+        self.train_loss = MeanMetric()
+        self.val_loss = MeanMetric()
         self.train_history = []
         self.val_history = []
+        self.train_loss_history = []
+        self.val_loss_history = []
 
     def forward(self, x):
         return self.net(x)
@@ -120,27 +137,34 @@ class SegModel(L.LightningModule):
         logits = self(image)
         loss = self.loss(logits, label)
         self.train_f1.update(logits.argmax(1), label)
+        self.train_loss.update(loss)
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
     def on_train_epoch_end(self):
         self.train_history.append(self.train_f1.compute().item())  # ty: ignore[missing-argument]
+        self.train_loss_history.append(self.train_loss.compute().item())  # ty: ignore[missing-argument]
         self.train_f1.reset()
+        self.train_loss.reset()
 
     def validation_step(self, batch, _):
         image, label = batch
         logits = self(image)
+        loss = self.loss(logits, label)
         self.val_f1.update(logits.argmax(1), label)
         self.val_iou.update(logits.argmax(1), label)
-        self.log("val_loss", self.loss(logits, label), prog_bar=True)
+        self.val_loss.update(loss)
+        self.log("val_loss", loss, prog_bar=True)
 
     def on_validation_epoch_end(self):
         f1 = self.val_f1.compute().item()  # ty: ignore[missing-argument]
         self.log("val_f1", f1, prog_bar=True)
         self.log("val_iou", self.val_iou.compute().item(), prog_bar=True)  # ty: ignore[missing-argument]
         self.val_history.append(f1)
+        self.val_loss_history.append(self.val_loss.compute().item())  # ty: ignore[missing-argument]
         self.val_f1.reset()
         self.val_iou.reset()
+        self.val_loss.reset()
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=self.lr)
@@ -161,16 +185,45 @@ def plot_distribution(data_dir, path, splits=("train", "val", "test")):
     plt.savefig(path, bbox_inches="tight")
 
 
-def plot_history(model, path):
-    epochs = range(1, len(model.train_history) + 1)
+def plot_curve(train_values, val_values, ylabel, path):
+    epochs = range(1, len(train_values) + 1)
     plt.figure()
-    plt.plot(epochs, model.train_history, marker="o", label="train macro F1")
-    plt.plot(epochs, model.val_history, marker="o", label="val macro F1")
+    plt.plot(epochs, train_values, marker="o", label=f"train {ylabel}")
+    plt.plot(epochs, val_values, marker="o", label=f"val {ylabel}")
     plt.xlabel("epoch")
-    plt.ylabel("macro F1")
+    plt.ylabel(ylabel)
     plt.legend()
     plt.grid(True)
     plt.savefig(path, bbox_inches="tight")
+    plt.close()
+
+
+def plot_samples(data_dir, path, n=3):
+    files = sorted(glob.glob(os.path.join(data_dir, "train", "*.npy")))[:n]
+    fig, axes = plt.subplots(n, 4, figsize=(12, 3 * n))
+    for row, file in enumerate(files):
+        tile = np.load(file).astype(np.float32)
+        rgb = tile[:3].transpose(1, 2, 0) / 255.0
+        panels = [
+            (rgb, "RGB", {}),
+            (tile[3], "NDVI", {"cmap": "viridis"}),
+            (tile[4], "shade", {"cmap": "gray"}),
+            (
+                tile[5],
+                "label",
+                {"cmap": LABEL_CMAP, "vmin": 0, "vmax": len(CLASS_NAMES) - 1},
+            ),
+        ]
+        for ax, (data, title, kw) in zip(axes[row], panels):
+            ax.imshow(data, **kw)
+            ax.set_title(title)
+            ax.axis("off")
+    handles = [
+        Patch(color=LABEL_CMAP(i), label=name) for i, name in enumerate(CLASS_NAMES)
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=len(CLASS_NAMES))
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
 
 
 def evaluate(model, test_loader, out_dir):
@@ -203,6 +256,12 @@ def evaluate(model, test_loader, out_dir):
     print(summary)
     with open(os.path.join(out_dir, "test_report.txt"), "w") as handle:
         handle.write(summary)
+    ConfusionMatrixDisplay.from_predictions(
+        targets, preds, labels=labels, display_labels=CLASS_NAMES, normalize="true"
+    )
+    plt.title("Test confusion matrix (row-normalised)")
+    plt.savefig(os.path.join(out_dir, "confusion_matrix.png"), bbox_inches="tight")
+    plt.close()
 
 
 def plot_predictions(model, test_loader, path, n=3):
@@ -225,15 +284,42 @@ def plot_predictions(model, test_loader, path, n=3):
     fig.savefig(path, bbox_inches="tight")
 
 
-def vectorize_predictions(model, dataset, out_dir, n_tiles=6):
+def adjacent_tiles(files, n_tiles, step=20):
+    """Largest spatially contiguous block of up to n_tiles tiles (20 m neighbours)."""
+    coords = {}
+    for file in files:
+        east, north = (
+            int(v) for v in os.path.splitext(os.path.basename(file))[0].split("_")[1:3]
+        )
+        coords[(east, north)] = file
+    block = []
+    for seed in coords:
+        seen, queue = [seed], [seed]
+        while queue and len(seen) < n_tiles:
+            east, north = queue.pop(0)
+            for nb in (
+                (east + step, north),
+                (east - step, north),
+                (east, north + step),
+                (east, north - step),
+            ):
+                if nb in coords and nb not in seen:
+                    seen.append(nb)
+                    queue.append(nb)
+        if len(seen) > len(block):
+            block = seen
+        if len(block) >= n_tiles:
+            break
+    return [coords[c] for c in block[:n_tiles]]
+
+
+def vectorize_predictions(model, files, channels, out_dir, n_tiles=6):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.eval().to(device)
     records = []
-    for file in dataset.files[:n_tiles]:
+    for file in adjacent_tiles(files, n_tiles):
         tile = np.load(file).astype(np.float32)
-        image = (
-            torch.from_numpy(tile[: dataset.channels] / 255.0).unsqueeze(0).to(device)
-        )
+        image = torch.from_numpy(tile[channels] / 255.0).unsqueeze(0).to(device)
         with torch.no_grad():
             pred = model(image).argmax(1)[0].cpu().numpy().astype("int32")
         name = os.path.splitext(os.path.basename(file))[0]
@@ -257,15 +343,23 @@ def main():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--use-ndvi", action="store_true")
     parser.add_argument("--use-shade", action="store_true")
     parser.add_argument("--use-aug", action="store_true")
     parser.add_argument("--out", default="outputs")
     args = parser.parse_args()
 
+    L.seed_everything(SEED, workers=True)
     os.makedirs(args.out, exist_ok=True)
     plot_distribution(args.data, os.path.join(args.out, "class_distribution.png"))
-    print("use shade", args.use_shade, "use aug", args.use_aug)
-    data = VegDataModule(args.data, args.use_shade, args.batch_size, args.num_workers)
+    plot_samples(args.data, os.path.join(args.out, "samples.png"))
+    print(
+        "use ndvi", args.use_ndvi, "use shade", args.use_shade, "use aug", args.use_aug
+    )
+    data = VegDataModule(
+        args.data, args.use_ndvi, args.use_shade, args.batch_size, args.num_workers
+    )
+    print("input channels:", data.in_channels)
     model = SegModel(in_channels=data.in_channels, lr=args.lr, use_aug=args.use_aug)
     early_stop = L.pytorch.callbacks.EarlyStopping(
         monitor="val_f1", mode="max", patience=PATIENCE
@@ -284,12 +378,26 @@ def main():
     optimizer = trainer.optimizers[0]
     print(f"optimizer lr: {optimizer.param_groups[0]['lr']}")
 
-    plot_history(model, os.path.join(args.out, "f1_curve.png"))
+    plot_curve(
+        model.train_history,
+        model.val_history,
+        "macro F1",
+        os.path.join(args.out, "f1_curve.png"),
+    )
+    plot_curve(
+        model.train_loss_history,
+        model.val_loss_history,
+        "loss",
+        os.path.join(args.out, "loss_curve.png"),
+    )
     best = SegModel.load_from_checkpoint(checkpoint.best_model_path)
     test_loader = data.test_dataloader()
     evaluate(best, test_loader, args.out)
     plot_predictions(best, test_loader, os.path.join(args.out, "predictions.png"))
-    vectorize_predictions(best, test_loader.dataset, args.out)
+    all_tiles = sorted(glob.glob(os.path.join(args.data, "*", "*.npy")))
+    vectorize_predictions(
+        best, all_tiles, input_channels(args.use_ndvi, args.use_shade), args.out
+    )
 
 
 if __name__ == "__main__":
