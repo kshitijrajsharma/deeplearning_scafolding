@@ -38,11 +38,20 @@ PATIENCE = 10  # early-stopping patience on val_f1
 RESOLUTION = 0.08
 TILE_CRS = "EPSG:25832"  # ETRS89 / UTM 32N;
 LABEL_CMAP = ListedColormap(["#2b2b2b", "#2ca02c", "#bcbd22"])  # bg, tall, flat
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 
 def input_channels(use_ndvi, use_shade):
     """Tile channel indices: RGB always, plus NDVI (3) and shade (4) when enabled."""
     return [0, 1, 2] + ([3] if use_ndvi else []) + ([4] if use_shade else [])
+
+
+def to_model_input(tile, channels):
+    """Select channels, scale to [0, 1], ImageNet-normalise the RGB triplet."""
+    image = torch.from_numpy(tile[channels] / 255.0)
+    image[:3] = (image[:3] - IMAGENET_MEAN) / IMAGENET_STD
+    return image
 
 
 class NpyDataset(Dataset):
@@ -57,7 +66,7 @@ class NpyDataset(Dataset):
 
     def __getitem__(self, index):
         tile = np.load(self.files[index]).astype(np.float32)
-        image = torch.from_numpy(tile[self.channels] / 255.0)
+        image = to_model_input(tile, self.channels)
         label = torch.from_numpy(tile[5]).long()
         return image, label
 
@@ -99,21 +108,23 @@ class VegDataModule(L.LightningDataModule):
 
 
 class SegModel(L.LightningModule):
-    def __init__(self, in_channels, num_classes=3, lr=1e-3, use_aug=True):
+    def __init__(self, in_channels, num_classes=3, lr=3e-4, use_aug=True):
         super().__init__()
         self.save_hyperparameters()
         self.lr = lr
         self.use_aug = use_aug
         self.net = smp.Unet(
             encoder_name="resnet18",
-            encoder_weights=None,
+            encoder_weights="imagenet",
             in_channels=in_channels,
             classes=num_classes,
         )
-        self.loss = nn.CrossEntropyLoss()
+        self.ce = nn.CrossEntropyLoss()
+        self.dice = smp.losses.DiceLoss(mode="multiclass")
         self.aug = K.AugmentationSequential(
             K.RandomHorizontalFlip(p=0.5),
             K.RandomVerticalFlip(p=0.5),
+            K.RandomAffine(degrees=90.0, scale=(0.8, 1.2), translate=(0.1, 0.1), p=0.5),
             data_keys=["input", "mask"],
         )
         self.train_f1 = MulticlassF1Score(num_classes, average="macro")
@@ -129,13 +140,16 @@ class SegModel(L.LightningModule):
     def forward(self, x):
         return self.net(x)
 
+    def _loss(self, logits, label):
+        return self.ce(logits, label) + self.dice(logits, label)
+
     def training_step(self, batch, _):
         image, label = batch
         if self.use_aug:
             image, mask = self.aug(image, label.unsqueeze(1).float())
             label = mask.squeeze(1).long()
         logits = self(image)
-        loss = self.loss(logits, label)
+        loss = self._loss(logits, label)
         self.train_f1.update(logits.argmax(1), label)
         self.train_loss.update(loss)
         self.log("train_loss", loss, prog_bar=True)
@@ -150,7 +164,7 @@ class SegModel(L.LightningModule):
     def validation_step(self, batch, _):
         image, label = batch
         logits = self(image)
-        loss = self.loss(logits, label)
+        loss = self._loss(logits, label)
         self.val_f1.update(logits.argmax(1), label)
         self.val_iou.update(logits.argmax(1), label)
         self.val_loss.update(loss)
@@ -167,7 +181,14 @@ class SegModel(L.LightningModule):
         self.val_loss.reset()
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=0.05)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="max", factor=0.5, patience=4
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_f1"},
+        }
 
 
 def plot_distribution(data_dir, path, splits=("train", "val", "test")):
@@ -271,7 +292,8 @@ def plot_predictions(model, test_loader, path, n=3):
         preds = model(images.to(device)).argmax(1).cpu()
     fig, axes = plt.subplots(n, 3, figsize=(9, 3 * n))
     for row in range(n):
-        rgb = images[row, :3].permute(1, 2, 0).numpy()
+        rgb = (images[row, :3] * IMAGENET_STD + IMAGENET_MEAN).clamp(0, 1)
+        rgb = rgb.permute(1, 2, 0).numpy()
         panels = [(rgb, "image"), (labels[row], "mask"), (preds[row], "prediction")]
         for ax, (data, title) in zip(axes[row], panels):
             ax.imshow(data, cmap=LABEL_CMAP, vmin=0, vmax=len(CLASS_NAMES) - 1)
@@ -319,7 +341,7 @@ def vectorize_predictions(model, files, channels, out_dir, n_tiles=6):
     records = []
     for file in adjacent_tiles(files, n_tiles):
         tile = np.load(file).astype(np.float32)
-        image = torch.from_numpy(tile[channels] / 255.0).unsqueeze(0).to(device)
+        image = to_model_input(tile, channels).unsqueeze(0).to(device)
         with torch.no_grad():
             pred = model(image).argmax(1)[0].cpu().numpy().astype("int32")
         name = os.path.splitext(os.path.basename(file))[0]
@@ -341,7 +363,7 @@ def main():
     parser.add_argument("--data", default="data/dataset")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--use-ndvi", action="store_true")
     parser.add_argument("--use-shade", action="store_true")
@@ -350,6 +372,7 @@ def main():
     args = parser.parse_args()
 
     L.seed_everything(SEED, workers=True)
+    torch.set_float32_matmul_precision("high")
     os.makedirs(args.out, exist_ok=True)
     plot_distribution(args.data, os.path.join(args.out, "class_distribution.png"))
     plot_samples(args.data, os.path.join(args.out, "samples.png"))
