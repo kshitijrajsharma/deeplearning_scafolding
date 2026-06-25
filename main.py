@@ -27,7 +27,11 @@ from sklearn.metrics import (
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from torchmetrics import MeanMetric
-from torchmetrics.classification import MulticlassF1Score, MulticlassJaccardIndex
+from torchmetrics.classification import (
+    MulticlassAccuracy,
+    MulticlassF1Score,
+    MulticlassJaccardIndex,
+)
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -129,11 +133,15 @@ class SegModel(L.LightningModule):
         )
         self.train_f1 = MulticlassF1Score(num_classes, average="macro")
         self.val_f1 = MulticlassF1Score(num_classes, average="macro")
+        self.train_acc = MulticlassAccuracy(num_classes, average="micro")
+        self.val_acc = MulticlassAccuracy(num_classes, average="micro")
         self.val_iou = MulticlassJaccardIndex(num_classes, average="macro")
         self.train_loss = MeanMetric()
         self.val_loss = MeanMetric()
         self.train_history = []
         self.val_history = []
+        self.train_acc_history = []
+        self.val_acc_history = []
         self.train_loss_history = []
         self.val_loss_history = []
 
@@ -151,14 +159,17 @@ class SegModel(L.LightningModule):
         logits = self(image)
         loss = self._loss(logits, label)
         self.train_f1.update(logits.argmax(1), label)
+        self.train_acc.update(logits.argmax(1), label)
         self.train_loss.update(loss)
         self.log("train_loss", loss, prog_bar=True)
         return loss
 
     def on_train_epoch_end(self):
         self.train_history.append(self.train_f1.compute().item())  # ty: ignore[missing-argument]
+        self.train_acc_history.append(self.train_acc.compute().item())  # ty: ignore[missing-argument]
         self.train_loss_history.append(self.train_loss.compute().item())  # ty: ignore[missing-argument]
         self.train_f1.reset()
+        self.train_acc.reset()
         self.train_loss.reset()
 
     def validation_step(self, batch, _):
@@ -166,6 +177,7 @@ class SegModel(L.LightningModule):
         logits = self(image)
         loss = self._loss(logits, label)
         self.val_f1.update(logits.argmax(1), label)
+        self.val_acc.update(logits.argmax(1), label)
         self.val_iou.update(logits.argmax(1), label)
         self.val_loss.update(loss)
         self.log("val_loss", loss, prog_bar=True)
@@ -175,8 +187,10 @@ class SegModel(L.LightningModule):
         self.log("val_f1", f1, prog_bar=True)
         self.log("val_iou", self.val_iou.compute().item(), prog_bar=True)  # ty: ignore[missing-argument]
         self.val_history.append(f1)
+        self.val_acc_history.append(self.val_acc.compute().item())  # ty: ignore[missing-argument]
         self.val_loss_history.append(self.val_loss.compute().item())  # ty: ignore[missing-argument]
         self.val_f1.reset()
+        self.val_acc.reset()
         self.val_iou.reset()
         self.val_loss.reset()
 
@@ -406,6 +420,12 @@ def main():
         model.val_history,
         "macro F1",
         os.path.join(args.out, "f1_curve.png"),
+    )
+    plot_curve(
+        model.train_acc_history,
+        model.val_acc_history,
+        "pixel accuracy",
+        os.path.join(args.out, "accuracy_curve.png"),
     )
     plot_curve(
         model.train_loss_history,

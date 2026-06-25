@@ -1,18 +1,18 @@
               precision    recall  f1-score   support
 
-  background     0.9535    0.9397    0.9466  26165304
-        tall     0.7222    0.6274    0.6714  11223308
-        flat     0.5327    0.6614    0.5901   7673888
+  background     0.9531    0.9382    0.9456  26165304
+        tall     0.7168    0.6430    0.6779  11223308
+        flat     0.5380    0.6478    0.5878   7673888
 
-    accuracy                         0.8145  45062500
-   macro avg     0.7362    0.7428    0.7360  45062500
-weighted avg     0.8243    0.8145    0.8173  45062500
+    accuracy                         0.8152  45062500
+   macro avg     0.7360    0.7430    0.7371  45062500
+weighted avg     0.8236    0.8152    0.8180  45062500
 
-macro F1 : 0.7360
-mIoU     : 0.6075
-per-class IoU: {'background': np.float64(0.8986), 'tall': np.float64(0.5054), 'flat': np.float64(0.4186)}
+macro F1 : 0.7371
+mIoU     : 0.6086
+per-class IoU: {'background': np.float64(0.8968), 'tall': np.float64(0.5128), 'flat': np.float64(0.4162)}
 
 confusion matrix (rows=true, cols=pred) ['background', 'tall', 'flat']:
-[[24587244   853798   724262]
- [  454229  7041124  3727955]
- [  743492  1854786  5075610]]
+[[24547921   862200   755183]
+ [  492686  7216686  3513936]
+ [  714468  1988480  4970940]]
